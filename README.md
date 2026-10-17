@@ -2,100 +2,153 @@
 
 # lust-lang
 
-A Rust subset that compiles much faster than Rust. Every valid lust program is a valid Rust program with the same output. The plan is in [DESIGN.md](DESIGN.md).
+Lust is an experiment. It asks one question: how fast can `check` and `build` get if a Rust-like language gives up the features that make Rust slow to compile?
 
-Status: **prototype.** It compiles a real subset of Rust end to end, with a real type checker and borrow checker. No generics, traits, or closures yet.
+To test this, lust compiles a small subset of Rust. Every valid lust program is also a valid Rust program, and it must print the same output as the `rustc` build. That rule makes `rustc` a free test oracle, and it gives lust programs a release path: compile the same file with `rustc -O`.
 
-## Demo: an agent's edit loop, 130x faster than rustc
+**Status: prototype.** About 11k lines of Rust and C. It has a real type checker and a real borrow checker, and it builds runnable programs end to end. It is not a usable Rust replacement. It has no generics, no traits, and no closures. Normal idiomatic Rust will not compile. This will fail, and so will most real crates:
 
-`bench/realish/agent_loop.py` plays the loop a coding agent runs all day: edit a function, check, build, run. It does this on a 31k-line crate (40 modules of a 784-line warehouse service: inventory, orders, a pricing-rule language with a tokenizer, parser, and evaluator, shortest-path routing, and reports). The 12 edits include behavior changes, a new function, and two mistakes (a type error and a borrow error) that both compilers must reject.
+```rust
+let total: i64 = xs.iter().map(|x| x * 2).sum(); // lust: error[L9001], no closures yet
+```
 
-- **rustc 1.99** runs in its fastest incremental setup on this machine: `-Z threads=8`, `-C incremental`, `-C debuginfo=0`.
-- **lust** runs through a warm `lust daemon`. The `lust` command is a thin client.
-- After every edit, both compilers must agree on pass or fail, and the two programs must print exactly the same output.
+Read [DESIGN.md](DESIGN.md) as a plan, not as a description of the code. The design describes later phases that do not exist yet. This README describes only what is in the tree today.
 
-24-core x86_64 Linux:
+## Numbers
 
-| # | Edit | rustc check | lust check | rustc build | lust build |
-|---|---|---|---|---|---|
-| 1 | tweak the bulk discount | 1351 ms | 13.5 ms | 2463 ms | 13.9 ms |
-| 2 | restock more often | 1212 ms | 7.5 ms | 2143 ms | 13.7 ms |
-| 3 | add a currency suffix | 1082 ms | 6.7 ms | 2134 ms | 14.3 ms |
-| 4 | lower the max quantity | 837 ms | 6.3 ms | 1884 ms | 19.0 ms |
-| 5 | allow cancelling paid orders | 1344 ms | 6.4 ms | 2435 ms | 13.7 ms |
-| 6 | mistake: wrong integer type (both reject) | 847 ms | 8.3 ms | - | - |
-| 7 | fix the type error | 782 ms | 8.0 ms | 1171 ms | 16.9 ms |
-| 8 | restock a bit more | 1281 ms | 7.6 ms | 2432 ms | 13.7 ms |
-| 9 | rewrite a heap check | 1232 ms | 6.5 ms | 2425 ms | 15.8 ms |
-| 10 | add a new helper function | 1169 ms | 13.8 ms | 2254 ms | 15.7 ms |
-| 11 | mistake: borrow conflict (both reject) | 819 ms | 9.1 ms | - | - |
-| 12 | fix the borrow conflict | 845 ms | 7.0 ms | 1106 ms | 18.0 ms |
-| | **total** | **12.80 s** | **0.101 s** | **20.45 s** | **0.155 s** |
+All numbers come from one machine: 24-core AMD EPYC 7B13, x86_64 Linux, `rustc 1.99.0`. We re-ran both benchmarks on 2026-10-17 and got results close to the runs recorded before. Expect run-to-run variance. Read the test shape before you read the speedup. The shape is most of the result.
 
-**Check: 127x. Build: 132x. Whole edit loop: 130x.**
+Short version: cold compiles of generated single-file code are about **20x to 45x** faster than `rustc`. Small edits through the warm daemon are about **130x** faster, on a test built to match the daemon's fast path. Programs that lust builds run **slower** than programs that `rustc` builds.
 
-The fine print:
+### Warm edit loop (the best case)
 
-- Running the built program is not faster. tcc does not optimize, so lust's binary runs about 1.7x slower than rustc's debug build (22 ms versus 13 ms per run here). If you count that run as part of every iteration, the loop is about 70x faster. This benchmark measures the compiler.
-- The crate is one module cloned 40 times, with renamed items. That gives realistic code at a realistic size, but not the variety of a real project.
-- One big crate is a worst case for rustc. Real projects split code into crates, which makes rustc's incremental builds faster.
-- Cold compiles are about 20x to 55x faster, not 100x. The 100x comes from incremental work (see below).
+`bench/realish/agent_loop.py` imitates a coding agent. It makes 12 small edits to a 31,405-line file, then runs `check` and `build` after each edit. Two edits are mistakes, one type error and one borrow error. Both compilers must accept or reject together, and both programs must print the same output.
 
-Reproduce with `python3 bench/realish/agent_loop.py`.
+- `rustc` runs with `-Z threads=8`, `-C incremental`, and `-C debuginfo=0`. This is its fastest setup on this machine for this test.
+- `lust` runs through a warm `lust daemon`.
+- Per edit: `rustc` takes 0.78 to 1.53 s to check and 1.14 to 2.84 s to build. Lust takes 5.6 to 17.9 ms to check and 14.1 to 19.5 ms to build.
 
-## Cold compiles
+| 12 edits, total | rustc | lust | Speedup |
+|---|---|---|---|
+| check | 14.06 s | 0.111 s | 127x |
+| build (10 edits that pass) | 22.30 s | 0.157 s | 142x |
+| check + build | 36.36 s | 0.268 s | 136x |
+| running the program (10 runs) | 132 ms | 252 ms | 0.5x |
 
-Same generated file, same output. rustc gets its best configuration for each number (the fastest of incremental, non-incremental, and `-Z threads=8`). Reproduce with `bench/compare.sh plain 640 3200`.
+Count the program runs as part of each iteration and the loop is about 70x faster. Count the cold runs that fill the caches first and it is about 60x faster.
+
+What makes this test favorable to lust:
+
+- The 31k-line file is one 780-line warehouse service cloned 40 times with renamed items. The code is real in style, but it has none of the variety of a real project.
+- The file is one crate in one file. That is a bad case for `rustc`. Real projects split code into crates, and Cargo builds crates in parallel. Lust has no Cargo support, so we cannot run that comparison yet.
+- Almost every edit changes one function body. That is exactly the case the daemon optimizes. An edit to a type or an `impl` block makes lust do a full rebuild.
+- The code uses none of the Rust features lust lacks. It cannot. Lust would reject it.
+
+Reproduce with `python3 bench/realish/agent_loop.py`. The script times each edit once.
+
+### Cold compiles
+
+`bench/compare.sh plain 640 3200` generates one file and gives it to both compilers. The "plain" shape is structs, enums, `match`, `Vec`, `String`, and `format!`, cloned into many similar units. `rustc` gets the fastest of three configurations for each number. Lust gets the median of three runs.
 
 | Lines | Operation | rustc | lust | Speedup |
 |---|---|---|---|---|
-| 9.6k | check | 1.33 s | 42 ms | 32x |
-| 9.6k | debug build | 2.49 s | 115 ms | 22x |
-| 48k | check | 5.86 s | 109 ms | 54x |
-| 48k | debug build | 11.1 s | 279 ms | 40x |
+| 9,602 | check | 1.36 s | 55 ms | 25x |
+| 9,602 | debug build | 2.83 s | 134 ms | 21x |
+| 48,002 | check | 6.18 s | 139 ms | 44x |
+| 48,002 | debug build | 12.81 s | 379 ms | 34x |
 
-## How incremental compiles work
+There is no "idiomatic Rust" row. Lust cannot compile iterator chains, closures, `Result` with `?`, or generic functions, so a speedup for that shape does not exist. [DESIGN.md](DESIGN.md) has the `rustc` baseline for that shape. It is the biggest open risk for the speed claim: generics and closures produce much more code to check and compile.
 
-The daemon keeps one session per file. An edit costs time that grows with the size of the edit, not of the program:
+### Run speed
 
-1. **Find what changed.** It compares the new source with the last one (two `memcmp`s), and lexes again only the chunks of whole items that the edit touched. Chunk boundaries are content-defined, so an inserted function does not move the others.
-2. **Classify the edit.** A token-level scan hashes each function body, and everything outside bodies, without positions. If only bodies changed, only those bodies are parsed, checked, and borrow-checked again. If only top-level functions were added, removed, or changed signature, it parses only the changed chunks, and re-checks only those functions and the bodies that mention their names. Anything else (a type, an impl) is a full rebuild.
-3. **Swap in new code without relinking.** Every call goes through a function table (`lust_fns[slot]`). A slot is a function's stable identity, so adding a function does not renumber the others. The first build links everything into `libbase.so`. After an edit, only the changed functions' unit is compiled, as an "overlay" object. The small executable links main plus the overlays against `libbase.so`, and at startup the overlays replace their entries in the table. After 32 overlays, the base is rebuilt.
-4. **Stay valid when code moves.** Panic locations in generated C are relative to the function's first line, so moving a function does not change its code.
+Lust compiles fast. Its programs do not run fast. The backend emits C and compiles it with `tcc`, which does not optimize. In daemon mode, every call also goes through a function table. In the test above, the lust program takes about 25 ms per run and the `rustc` debug program takes about 13 ms. For a fast binary, compile the same source with `rustc -O`. Lust has no release mode.
 
-## Build
+## Why it is fast
+
+Four reasons:
+
+1. **Less language to check.** No user macros and no proc macros. No traits, so no trait search. Signatures are explicit. The checker does less work because the language asks for less.
+2. **No LLVM in dev builds.** Lust emits C and compiles it with `tcc`. `tcc` is much faster than LLVM and produces worse code.
+3. **Parallel work per function.** Parsing, type checking, borrow checking, and C code generation run per function, on a flat IR, across cores.
+4. **The daemon redoes only what an edit touches.** See the next section.
+
+None of this proves that the speed survives generics, traits, and closures. That test comes later.
+
+## How the daemon works
+
+`lust daemon` keeps one warm session per file for the current directory. The `lust` command is a thin client. If no daemon answers, the client runs `lust-core` cold in a fresh process.
+
+On each edit, the daemon does this:
+
+1. It compares the new source with the last source and lexes again only the items the edit touched. Item boundaries come from content hashes, so an inserted function does not move the others.
+2. It hashes each function body and everything outside bodies, with no positions. If only bodies changed, it parses, checks, and borrow-checks only those bodies. If top-level functions changed signature, it re-checks them and every body that names them. Any other change, such as a type or an `impl`, is a full rebuild.
+3. It compiles only the changed functions and patches them in without a full relink. Every call goes through a function table, and each function owns one stable slot. The first build links all units into `libbase.so`. Later builds link a small executable with the changed units as overlays against `libbase.so`. At startup, the overlays replace their table entries. After 32 overlays, the daemon rebuilds the base.
+
+Daemon builds are not standalone. The executable loads `libbase.so` from the daemon cache directory. Do not ship it. A cold `lust build` links a standalone executable.
+
+## Build and use
+
+You need a Rust toolchain and a C build environment. The first step clones `tinycc` from GitHub, so it needs network access once. We develop and test on x86_64 Linux. The daemon uses Unix sockets. Other platforms are not verified.
 
 ```sh
 scripts/build-tcc.sh      # builds the pinned tinycc into third_party/tcc
 cargo build --release     # builds `lust` (client) and `lust-core` (compiler)
 ```
 
-## Use
-
 ```sh
-lust daemon                                        # optional: warm, incremental compiles for this directory
+lust daemon                                        # optional: warm compiles for this directory
 lust check main.rs [--json] [--timings]
 lust build main.rs [-o out] [-g] [--emit-c prefix] [--timings]
 lust run main.rs [-- args]
 ```
 
-Without a daemon, `lust` compiles cold in a fresh process and links a standalone executable. With a daemon, the executable loads `libbase.so` from the daemon's cache directory.
+Each command takes one `.rs` file. There is no Cargo support, no multi-file crate, and no external crates.
 
-`--json` prints one diagnostic per line, each with `code`, `message`, `at`, and `fix`.
+`--json` prints one diagnostic per line, each with `code`, `message`, `at`, and `fix`. The `fix` text tells the user what to write instead. This format exists for coding agents.
+
+This is a complete lust program. It is also a complete Rust program:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Point { x: i64, y: i64 }
+
+impl Point {
+    fn manhattan(&self, other: &Point) -> i64 {
+        (self.x - other.x).abs() + (self.y - other.y).abs()
+    }
+}
+
+fn main() {
+    let a = Point { x: 1, y: 2 };
+    let b = Point { x: 4, y: 6 };
+    println!("{} {:?}", a.manhattan(&b), a == b);
+}
+```
 
 ## Supported subset
 
+Supported today:
+
 - Items: `fn`, `struct` (named fields or unit), `enum` (unit, tuple, and struct variants), inherent `impl` blocks, `use`.
-- Derives: `Debug`, `Clone`, `Copy`, `PartialEq`, `Eq`, `Hash` (Hash is accepted, but nothing uses it yet).
+- Derives: `Debug`, `Clone`, `Copy`, `PartialEq`, `Eq`, `Hash`. `Hash` is accepted, but nothing uses it yet.
 - Types: integers (no 128-bit), `bool`, `char`, `String`, `&str`, `Vec<T>`, `Option<T>`, `&T`, `&mut T`.
-- Control flow: `if`, `if let`, `match` (guards, `|`, ranges, nested patterns, default binding modes), `loop`, `while`, `while let`, `for` over ranges, `&vec`, `&mut vec`, and `s.chars()`, `break` with a value, early `return`.
-- Macros: `println!`, `print!`, `eprintln!`, `eprint!`, `format!` (`{}`, `{:?}`, positional, and captured names), `vec!`, `panic!`, `assert!`, `assert_eq!`, `assert_ne!`, `todo!`, `unreachable!`.
-- Std: common methods on `String`, `str`, `Vec`, `Option`, `char`, and integers, plus `std::env::args().count()`.
-- Borrow checking: moves, initialization, mutability, NLL-style conflicting borrows with two-phase borrows, dangling references, temporaries dropped while borrowed, and returned references (elision only).
+- Control flow: `if`, `if let`, `match` (guards, `|`, ranges, nested patterns), `loop`, `while`, `while let`, `for` over ranges, `&vec`, `&mut vec`, and `s.chars()`, `break` with a value, early `return`.
+- Macros: `println!`, `print!`, `eprintln!`, `eprint!`, `format!`, `vec!`, `panic!`, `assert!`, `assert_eq!`, `assert_ne!`, `todo!`, `unreachable!`. These are built in.
+- Std: common methods on `String`, `str`, `Vec`, `Option`, `char`, and integers, plus `std::env::args().count()`. This is a small hand-written surface, not the Rust standard library.
+- Borrow checking: moves, initialization, mutability, conflicting borrows with NLL-style lifetimes and two-phase borrows, dangling references, temporaries dropped while borrowed, and returned references by elision only.
 
-Not yet: generics, traits, closures, iterators beyond `chars()`, `Result` and `?`, `HashMap`, floats, tuples, arrays, slices, modules, `const`, `let`-else, and moving one field out of a struct while keeping the rest. Each one gives error `L9001`.
+Not supported yet. Each of these gives error `L9001`:
 
-Lust rejects on purpose: lifetime syntax (`L0203`), references in struct fields (`L0201`), and user macros (`L0401`).
+- Generics, traits, and closures.
+- Iterators beyond `chars()` and the `for` loops above.
+- `Result` and `?`, `HashMap`, floats, tuples, arrays, slices, modules, `const`, `let`-else.
+- A move of one field out of a struct that keeps the rest of the struct alive.
+
+Rejected on purpose, by design:
+
+- Lifetime syntax (`L0203`). Elision is the only option.
+- References in struct fields (`L0201`). Store an owned value, or pass the reference to each method.
+- User macros (`L0401`). Write a function.
 
 ## Tests
 
@@ -104,11 +157,11 @@ scripts/difftest.sh             # compare with rustc
 SANITIZE=1 scripts/difftest.sh  # also run the generated C under ASan and UBSan
 ```
 
-- `tests/pass`: lust and rustc must give the same stdout and exit status.
-- `tests/fail`: rustc and lust must both reject. lust must give the expected error code.
+- `tests/pass`: lust and `rustc` must give the same stdout and exit status.
+- `tests/fail`: `rustc` and lust must both reject the program, and lust must give the expected error code.
 - `tests/reject`: valid Rust that lust rejects on purpose.
 
-The agent-loop benchmark also tests incremental mode: every edit's result is compared with rustc.
+The corpus is small: 37 programs today (11 pass, 23 fail, 3 reject). It checks that the two compilers agree on these programs. It does not prove that lust matches `rustc` in general. The agent-loop benchmark adds one larger check: it compares both compilers after every edit.
 
 ## Code map
 
@@ -116,10 +169,7 @@ The agent-loop benchmark also tests incremental mode: every edit's result is com
 |---|---|
 | `src/client.rs`, `src/protocol.rs` | The thin `lust` client and the daemon wire format. |
 | `src/main.rs`, `src/daemon.rs`, `src/driver.rs` | `lust-core`: cold compiles, the daemon, and the incremental pipeline. |
-| `src/lexer.rs`, `src/scan.rs`, `src/parser.rs`, `src/ast.rs` | Syntax in flat arenas; the token scan that finds what changed. |
-| `src/collect.rs` | Item tables and signatures. |
-| `src/check.rs` | Local type inference, method resolution, exhaustiveness. |
-| `src/lower.rs`, `src/ir.rs` | Lowering to a MIR-like CFG with explicit temporaries and drops. |
-| `src/borrowck.rs` | Init, move, and loan dataflow, plus liveness. |
-| `src/cgen.rs`, `src/runtime.c` | C backend and runtime. Checked math is done in 64-bit unsigned, so C never sees signed overflow. |
-| `src/tcc.rs` | libtcc in process, parallel `tcc -c` for large programs, and shared-library linking. |
+| `src/lexer.rs`, `src/scan.rs`, `src/parser.rs`, `src/ast.rs` | Syntax in flat arenas, plus the token scan that finds what changed. |
+| `src/collect.rs`, `src/check.rs` | Item tables and signatures, then type inference, method resolution, and match exhaustiveness. |
+| `src/lower.rs`, `src/ir.rs`, `src/borrowck.rs` | Lowering to a MIR-like CFG, then init, move, and loan dataflow. |
+| `src/cgen.rs`, `src/runtime.c`, `src/tcc.rs` | C backend, runtime, and `tcc` integration. Checked math runs in 64-bit unsigned, so the C code never has signed overflow. |
