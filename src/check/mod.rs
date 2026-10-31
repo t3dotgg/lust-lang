@@ -3099,9 +3099,47 @@ enum StrKind {
     Cow,
 }
 
+/// Integer type width and signedness by its written name; `usize`/`isize`
+/// count as pointer-sized (never lossless, since that depends on the target).
+fn int_shape(name: &str) -> Option<(u32, bool)> {
+    Some(match name {
+        "u8" => (8, false),
+        "u16" => (16, false),
+        "u32" => (32, false),
+        "u64" => (64, false),
+        "u128" => (128, false),
+        "i8" => (8, true),
+        "i16" => (16, true),
+        "i32" => (32, true),
+        "i64" => (64, true),
+        "i128" => (128, true),
+        "usize" => (0, false),
+        "isize" => (0, true),
+        _ => return None,
+    })
+}
+
+/// Whether `value as to` keeps every value of `from` (a widening cast).
+fn lossless_cast(from: &str, to: &str) -> bool {
+    match (int_shape(from), int_shape(to)) {
+        (Some((fw, fs)), Some((tw, ts))) if fw > 0 && tw > 0 => (fs == ts && fw <= tw) || (!fs && ts && fw < tw),
+        _ => false,
+    }
+}
+
 impl<'p> Ctx<'p> {
     fn err(&mut self, code: &'static str, span: Span, msg: impl Into<String>, fix: impl Into<String>) {
         self.errs.push(Diag::new(code, span, msg, fix));
+    }
+    /// An error with a concrete cast edit: `(<expr at at>) as <to>` for an
+    /// integer value of type `from`. The edit is `auto` only for a widening cast,
+    /// which cannot change the value; a narrowing one is offered, not applied.
+    fn err_cast(&mut self, code: &'static str, span: Span, msg: String, fix: String, at: Span, from: &str, to: &str) {
+        let auto = lossless_cast(from, to);
+        let d = Diag::new(code, span, msg, fix)
+            .with_edit(crate::diag::Edit { start: at.lo, end: at.lo, replacement: "(".to_string(), auto })
+            .with_edit(crate::diag::Edit { start: at.hi, end: at.hi, replacement: format!(") as {to}"), auto });
+        self.errs.push(d);
     }
     /// True when this body already has an error and `t` still holds an
     /// unresolved inference variable: as rustc's "tainted by errors"
@@ -6647,6 +6685,11 @@ impl<'p> Ctx<'p> {
         } else {
             format!("Change the value to type `{e}`, or change the expected type.")
         };
+        if int_shape(&e).is_some() && int_shape(&f).is_some() {
+            let fix = format!("Cast it: write `(value) as {e}`.");
+            self.err_cast("L0110", span, format!("mismatched types: expected `{e}`, found `{f}`"), fix, span, &f, &e);
+            return;
+        }
         self.err("L0110", span, format!("mismatched types: expected `{e}`, found `{f}`"), fix);
     }
     /// Checks `found` against `expected` at a coercion site. Records the coercion on `e`.
@@ -19151,12 +19194,25 @@ impl<'p> Ctx<'p> {
                 return UNIT;
             }
             let (a, b) = (self.tn(lt), self.tn(rt));
-            self.err(
-                "L0113",
-                span,
-                format!("cannot apply `{}=` to `{a}` and `{b}`", op.symbol()),
-                "Both sides must be the same integer type.",
-            );
+            if int_shape(&a).is_some() && int_shape(&b).is_some() && !matches!(op, BinOp::Shl | BinOp::Shr) {
+                let at = self.span(rhs);
+                self.err_cast(
+                    "L0113",
+                    span,
+                    format!("cannot apply `{}=` to `{a}` and `{b}`", op.symbol()),
+                    format!("Cast the right side: write `(rhs) as {a}`."),
+                    at,
+                    &b,
+                    &a,
+                );
+            } else {
+                self.err(
+                    "L0113",
+                    span,
+                    format!("cannot apply `{}=` to `{a}` and `{b}`", op.symbol()),
+                    "Both sides must be the same integer type.",
+                );
+            }
         }
         self.set_res(e, Res::Bin { ld: 0, rd });
         UNIT
@@ -19256,7 +19312,13 @@ impl<'p> Ctx<'p> {
             } else {
                 "Both operands must have the same type, and the type must support this operator."
             };
-            cx.err("L0113", span, format!("cannot apply `{}` to `{a}` and `{b}`", op.symbol()), fix);
+            if int_shape(&a).is_some() && int_shape(&b).is_some() && !matches!(op, Shl | Shr) {
+                let at = cx.span(rhs);
+                let fix = format!("Cast the right operand: write `(rhs) as {a}`.");
+                cx.err_cast("L0113", span, format!("cannot apply `{}` to `{a}` and `{b}`", op.symbol()), fix, at, &b, &a);
+            } else {
+                cx.err("L0113", span, format!("cannot apply `{}` to `{a}` and `{b}`", op.symbol()), fix);
+            }
             if op.is_cmp() { BOOL } else { ERROR }
         };
         // Both operand types still open (closure parameters a later

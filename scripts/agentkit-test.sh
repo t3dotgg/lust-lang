@@ -52,6 +52,49 @@ check diag-schema $? "see the python assert above"
 "$lust" check "$root/tests/fail/two_mut_borrows.rs" >"$work/diag.txt" 2>&1
 grep -q "mutably borrowed here" "$work/diag.txt"; check diag-human-label $? "human output must show the label"
 
+# --- 1b. Machine-applicable edits: integer mismatches carry a cast edit ---
+# L0110 (mismatched integer types) and L0113 (an operator on two integer types)
+# carry a `(expr) as T` edit; `auto` only for a widening cast. Applying every
+# edit gives a program that lust and rustc both accept.
+cat > "$work/cast.rs" <<'RSEOF'
+fn widen(x: u32) -> u64 {
+    let y: u64 = x << 2;
+    let mut z: u64 = y + x;
+    z += x;
+    z
+}
+fn narrow(a: u64) -> u8 {
+    let b: u8 = a;
+    b
+}
+fn main() {
+    println!("{} {}", widen(3), narrow(7));
+}
+RSEOF
+"$lust" check --json "$work/cast.rs" > "$work/cast.json" 2>/dev/null
+python3 - "$work/cast.json" "$work/cast.rs" "$work/cast_fixed.rs" <<'PYEOF'
+import json, sys
+recs = [json.loads(l) for l in open(sys.argv[1])]
+errs = [d for d in recs if d.get("severity") == "error"]
+assert {d["code"] for d in errs} == {"L0110", "L0113"}, [(d["code"], d["message"]) for d in errs]
+assert all(len(d["edits"]) == 2 for d in errs), [d["edits"] for d in errs]
+auto = {d["message"]: d["edits"][0]["auto"] for d in errs}
+# u32 -> u64 widens (auto); u64 -> u8 narrows (offered, not auto).
+assert any(a for m, a in auto.items() if "found `u32`" in m or "and `u32`" in m), auto
+assert not auto["mismatched types: expected `u8`, found `u64`"], auto
+src = open(sys.argv[2], "rb").read()
+edits = sorted({(e["start"], e["end"], e["replacement"]) for d in errs for e in d["edits"]}, reverse=True)
+for s, e, r in edits:
+    src = src[:s] + r.encode() + src[e:]
+open(sys.argv[3], "wb").write(src)
+PYEOF
+check diag-cast-edits $? "see the python assert above"
+"$lust" check "$work/cast_fixed.rs" >/dev/null 2>&1; check diag-cast-edits-apply $? "the program with every edit applied must check"
+if command -v rustc >/dev/null 2>&1; then
+  rustc --edition 2024 --emit=metadata -o "$work/cast_fixed.rmeta" "$work/cast_fixed.rs" >/dev/null 2>&1
+  check diag-cast-edits-rustc $? "rustc must accept the program with every edit applied"
+fi
+
 # --- 2. Bounded output: default cap, truncation record, --max-errors 0 ---
 python3 -c '
 lines = ["fn main() {"]
