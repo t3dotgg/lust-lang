@@ -9070,10 +9070,15 @@ fn written_glue_impl(
     }
     let Some((def, _)) = tys.adt_parts(t) else { return false };
     let lang = &p.gx.lang;
+    // A Copy type's written `clone` does not count. Asked of this instance
+    // (`is_copy` checks the Copy impl's bounds): a header match alone made
+    // `Reverse<String>` count as Copy through `impl<T: Copy> Copy for Reverse<T>`,
+    // and so `Vec<Reverse<String>>` was not Clone.
     if trait_def == lang.clone
         && p.gx.index.impls_of_trait(lang.copy).iter().any(|&id| {
             p.gx.index.peek(id).head == SelfHead::Adt(def) && match_impl_pat(p, tys, p.gx.index.get(id).self_ty(&p.tys), t, &mut Vec::new())
         })
+        && is_copy(p, tys, t)
     {
         return false;
     }
@@ -9214,6 +9219,22 @@ fn glue_clone(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> b
     // clone (`iter_clone_is_copy`).
     if tys.is_chars_ty(t) || crate::ty::iter::iter_parts(tys, t).is_some() {
         return iter_clone_is_copy(p, tys, t);
+    }
+    // std's `Reverse<T>` when it is Copy: its written `clone` is
+    // `Reverse(self.0.clone())` (library/core/src/cmp.rs), so the glue's
+    // bitwise copy is that clone exactly when `T`'s glue clone is a copy,
+    // which `glue_clone` of a Copy `T` answers (a Copy `T` with a written
+    // `Clone` stays rejected there). Without this, `Vec<Reverse<u32>>`,
+    // `Option<Reverse<_>>`, and `VecDeque<Reverse<_>>` were not Clone: the
+    // written impl of a Copy type does not count for glue (`written_glue_impl`).
+    // A non-Copy `Reverse<T>` takes the written-impl path below.
+    if let Some(a) = tys.local_adt(t)
+        && p.is_reverse_adt(a)
+        && is_copy(p, tys, t)
+        && let Some((_, args)) = tys.adt_parts(t)
+        && let Some(inner) = tys.args(args).first().and_then(|g| g.as_ty())
+    {
+        return glue_clone(p, tys, inner, seen);
     }
     match tys.local_adt(t) {
         Some(a) => {
